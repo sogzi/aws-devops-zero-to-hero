@@ -1,0 +1,144 @@
+# Deploying User Data Scripts to Private EC2 Instances via a Bastion (VPC Peering)
+
+This guide covers copying `userdata-server1.sh` and `userdata-server2.sh` onto running private instances in **VPC B**, 
+reached through a bastion host in **VPC A** over a **VPC peering connection**, then running them and testing the Application Load Balancer (ALB).
+
+## Architecture
+
+```
+Your Mac ──SSH──> Bastion (VPC A, public subnet)
+                     │
+                     └── VPC peering ──> Instance 1 (VPC B, private)
+                                         Instance 2 (VPC B, private)
+                                              ▲
+                          Internet ──> ALB ───┘  (port 80)
+```
+
+## 0. Prerequisites (check once)
+
+| Check | Where |
+|---|---|
+| Peering connection status is **Active** | VPC > Peering connections |
+| VPC A route table has a route to VPC B's CIDR via the peering connection | VPC > Route tables |
+| VPC B route table has a route to VPC A's CIDR via the peering connection | VPC > Route tables |
+| Instance SG allows **SSH (22)** from the bastion's private IP or VPC A's CIDR | EC2 > Security groups |
+| Instance SG allows **HTTP (80)** (and 8080 for Jenkins) from the ALB's security group | EC2 > Security groups |
+| VPC B private subnets have outbound internet (NAT gateway) for `dnf` and the Jenkins repo | VPC > Route tables |
+
+## 1. Set up your SSH config (on your Mac)
+
+Edit `~/.ssh/config`:
+
+```
+Host bastion
+    HostName <bastion-public-ip>
+    User ec2-user
+    IdentityFile /Users/<you>/Downloads/demo-project.pem
+
+Host vpc-b-instance-1
+    HostName <instance-1-private-ip>
+    User ec2-user
+    IdentityFile /Users/<you>/Downloads/demo-project.pem
+    ProxyJump bastion
+
+Host vpc-b-instance-2
+    HostName <instance-2-private-ip>
+    User ec2-user
+    IdentityFile /Users/<you>/Downloads/demo-project.pem
+    ProxyJump bastion
+```
+
+Make sure the key file is protected:
+
+```bash
+chmod 400 /Users/<you>/Downloads/demo-project.pem
+```
+
+## 2. Copy the scripts to the instances (from your Mac)
+
+Run these from the folder containing the scripts. **Note the `:~/` at the end**; without the colon, scp just makes a local file.
+
+```bash
+scp userdata-server1.sh vpc-b-instance-1:~/
+scp userdata-server2.sh vpc-b-instance-2:~/
+```
+
+## 3. SSH into each instance
+
+```bash
+ssh vpc-b-instance-1
+```
+
+Confirm the file arrived and is complete (about 50 lines):
+
+```bash
+ls -l ~
+wc -l ~/userdata-server1.sh
+```
+
+If an old or wrong copy is lying around, remove it (this is permanent):
+
+```bash
+rm ~/<old-file-name>.sh
+```
+
+## 4. Run the script as root
+
+```bash
+sudo bash ~/userdata-server1.sh
+```
+
+It takes a few minutes. To keep it running if your SSH session drops:
+
+```bash
+sudo nohup bash ~/userdata-server1.sh > /dev/null 2>&1 &
+sudo tail -f /var/log/user-data.log      # Ctrl+C to stop watching
+```
+
+> Always use `sudo`. Without root, `dnf`, `systemctl` and writes to `/etc/yum.repos.d/` fail with "Access denied" / "Permission denied".
+
+## 5. Verify on the instance
+
+```bash
+curl -s localhost | grep Hello           # Hello from SERVER 1
+systemctl is-active httpd jenkins        # active  active
+sudo tail -n 5 /var/log/user-data.log    # Jenkins initial admin password
+```
+
+Then `exit` and repeat steps 3 to 5 for instance 2 using `userdata-server2.sh` (it should print **SERVER 2**).
+
+## 6. Test the load balancer
+
+1. In **EC2 > Target Groups**, wait until both targets show **healthy** (about a minute after Apache starts).
+2. Copy the ALB's **DNS name** (EC2 > Load Balancers) and open it with `http://` in several browsers or incognito windows:
+
+   ```
+   http://<alb-dns-name>
+   ```
+
+   You will see the blue **SERVER 1** page or the green **SERVER 2** page.
+
+3. For a clearer view of the round-robin, use curl from your Mac, since browsers often reuse one connection:
+
+   ```bash
+   for i in {1..10}; do curl -s http://<alb-dns-name> | grep Hello; done
+   ```
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `Access denied` / `Permission denied` in script output | Script run without `sudo` |
+| `here-document ... delimited by end-of-file` | Script file truncated or edited; copy it again and check `wc -l` |
+| `Unit httpd.service not found` | Script never completed; re-run as root |
+| `dnf` or `curl pkg.jenkins.io` hangs | No NAT gateway / outbound route from the private subnet |
+| ALB **502 Bad Gateway** | Apache not running, or target group port/protocol is not HTTP:80 |
+| ALB **503** | No healthy targets (check SGs and health check settings) |
+| ALB times out | ALB is internal, in non-public subnets, or its SG blocks port 80 |
+| Can't SSH to private instance | Peering routes missing, or instance SG not allowing 22 from the bastion |
+
+## Optional: expose Jenkins through the ALB
+
+Add a second listener on **HTTP:8080** forwarding to a target group on port **8080** (health check path `/login`), 
+and allow 8080 on the ALB and instance security groups. Browse to `http://<alb-dns-name>:8080`. Each instance runs its own independent Jenkins, 
+so logins and jobs are not shared between them.
