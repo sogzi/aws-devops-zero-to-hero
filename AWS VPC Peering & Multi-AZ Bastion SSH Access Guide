@@ -1,6 +1,7 @@
 # AWS VPC Peering & Multi-AZ Bastion SSH Access Guide
 
-This guide documents how to configure **AWS VPC Peering** between two VPCs (**VPC A** and **VPC B**) and securely SSH from a single bastion host in VPC A into multiple private EC2 instances across different Availability Zones (AZs) in VPC B using separate `.pem` key pairs.
+This guide documents how to configure **AWS VPC Peering** between two VPCs (**VPC A** and **VPC B**) and securely SSH from a single bastion host in VPC A 
+into multiple private EC2 instances across different Availability Zones (AZs) in VPC B using separate `.pem` key pairs.
 
 ---
 
@@ -14,7 +15,8 @@ This guide documents how to configure **AWS VPC Peering** between two VPCs (**VP
 | **Private Instance 1** | VPC B (Private Subnet AZ 1) | `10.1.0.x` | Uses `vpc-b-key.pem` |
 | **Private Instance 2** | VPC B (Private Subnet AZ 2) | `10.1.0.y` | Uses `vpc-b-key.pem` |
 
-> **Prerequisite Check:** Ensure CIDR blocks do not overlap. `10.0.0.0/16` (`10.0.0.0` – `10.0.255.255`) and `10.1.0.0/24` (`10.1.0.0` – `10.1.0.255`) are non-overlapping and valid for peering.
+> **Prerequisite Check:** Ensure CIDR blocks for both VPC do not overlap. `10.0.0.0/16` (`10.0.0.0` – `10.0.255.255`) and `10.1.0.0/24` (`10.1.0.0` – `10.1.0.255`) 
+are non-overlapping and valid for peering.
 
 ---
 
@@ -67,7 +69,10 @@ Apply the following inbound rule to the security group(s) protecting both privat
 
 ## Step 4: Configure Local SSH for Distinct `.pem` Keys
 
-Because the bastion host and the VPC B private instances use **different `.pem` key pairs**, configure your local `~/.ssh/config` file to map each key to its respective host automatically via `ProxyJump`.
+Because the bastion host and the VPC B private instances use **different `.pem` key pairs**, configure your local `~/.ssh/config` file 
+to map each key to its respective host automatically via `ProxyJump`.
+
+In terminal ---> mkdir -p ~/.ssh && nano ~/.ssh/config
 
 ### 1. Set File Permissions on Keys
 Ensure both private key files have restricted read-only permissions:
@@ -112,6 +117,7 @@ ssh vpc-b-instance-2
 
 ## Troubleshooting Quick Reference
 
-* **`Connection closed by UNKNOWN port 65535`:** Usually caused by SSH failing authentication on the first hop (the bastion host) because the bastion's `.pem` key was not supplied to `ProxyJump`. Using `~/.ssh/config` with distinct `IdentityFile` entries resolves this.
+* **`Connection closed by UNKNOWN port 65535`:** Usually caused by SSH failing authentication on the first hop (the bastion host) because the bastion's `.pem` key 
+was not supplied to `ProxyJump`. Using `~/.ssh/config` with distinct `IdentityFile` entries resolves this.
 * **`Connection timed out`:** Indicates a missing route in either VPC A or one of the AZ subnet route tables in VPC B, or a Security Group / Network ACL blocking TCP port `22`.
 * **Diagnostic Command:** Run `ssh -v vpc-b-instance-1` to inspect verbose logs and confirm whether authentication fails on Hop 1 (Bastion) or Hop 2 (VPC B target).
