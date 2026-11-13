@@ -1,0 +1,117 @@
+# AWS VPC Peering & Multi-AZ Bastion SSH Access Guide
+
+This guide documents how to configure **AWS VPC Peering** between two VPCs (**VPC A** and **VPC B**) and securely SSH from a single bastion host in VPC A into multiple private EC2 instances across different Availability Zones (AZs) in VPC B using separate `.pem` key pairs.
+
+---
+
+## Architecture Overview
+
+| Component | VPC | CIDR / IP Details | Notes |
+| :--- | :--- | :--- | :--- |
+| **VPC A** | Requester VPC | `10.0.0.0/16` | Hosts the public bastion host |
+| **Bastion Host** | VPC A (Public Subnet) | Public IP + Private IP (`10.0.x.x`) | Uses `bastion-key.pem` |
+| **VPC B** | Accepter VPC | `10.1.0.0/24` | 251 usable IPs across 2 AZs |
+| **Private Instance 1** | VPC B (Private Subnet AZ 1) | `10.1.0.x` | Uses `vpc-b-key.pem` |
+| **Private Instance 2** | VPC B (Private Subnet AZ 2) | `10.1.0.y` | Uses `vpc-b-key.pem` |
+
+> **Prerequisite Check:** Ensure CIDR blocks do not overlap. `10.0.0.0/16` (`10.0.0.0` – `10.0.255.255`) and `10.1.0.0/24` (`10.1.0.0` – `10.1.0.255`) are non-overlapping and valid for peering.
+
+---
+
+## Step 1: Create and Accept the VPC Peering Connection
+
+1. Open the **AWS VPC Console** and navigate to **Peering connections** > **Create peering connection**.
+2. Set a descriptive name (e.g., `vpc-a-to-vpc-b-peering`).
+3. Configure the **Requester VPC**: Select **VPC A** (`10.0.0.0/16`).
+4. Configure the **Accepter VPC**: Choose your account and region, then select **VPC B** (`10.1.0.0/24`).
+5. Click **Create peering connection**.
+6. Select the newly created peering connection (`pcx-xxxxxxxx`), click **Actions** > **Accept request**, and confirm until the status becomes **Active**.
+
+---
+
+## Step 2: Update Route Tables
+
+Traffic requires bidirectional routes so SSH requests can reach VPC B and return to VPC A.
+
+### 1. VPC A (Bastion Public Subnet Route Table)
+1. Navigate to **Route tables** and select the route table attached to the bastion host's public subnet.
+2. Click **Routes** > **Edit routes** > **Add route**:
+   * **Destination:** `10.1.0.0/24`
+   * **Target:** Peering Connection (`pcx-xxxxxxxx`)
+3. Click **Save changes**.
+
+### 2. VPC B (Private Subnet Route Tables Across Both AZs)
+Because the two private instances reside in two separate Availability Zones (two private subnets):
+1. Check **Subnets** > **Route table** tab for both private subnets in VPC B.
+2. If both private subnets share a single route table, update it once. If each AZ subnet uses its own route table, update **both** route tables with the following rule:
+   * **Destination:** `10.0.0.0/16`
+   * **Target:** Peering Connection (`pcx-xxxxxxxx`)
+3. Click **Save changes**.
+
+---
+
+## Step 3: Configure Security Groups
+
+### 1. Bastion Host Security Group (VPC A)
+* **Inbound:** Allow **SSH (TCP 22)** strictly from your trusted local public IP (`<your-ip>/32`).
+* **Outbound:** Ensure outbound **SSH (TCP 22)** is allowed to `10.1.0.0/24` (default `0.0.0.0/0` already permits this).
+
+### 2. Private Instances Security Group(s) (VPC B)
+Apply the following inbound rule to the security group(s) protecting both private EC2 instances:
+* **Type:** SSH
+* **Protocol:** TCP
+* **Port Range:** `22`
+* **Source:** `10.0.0.0/16` *(or restrict further to your bastion's private IP `<bastion-private-ip>/32`)*
+
+---
+
+## Step 4: Configure Local SSH for Distinct `.pem` Keys
+
+Because the bastion host and the VPC B private instances use **different `.pem` key pairs**, configure your local `~/.ssh/config` file to map each key to its respective host automatically via `ProxyJump`.
+
+### 1. Set File Permissions on Keys
+Ensure both private key files have restricted read-only permissions:
+```bash
+chmod 400 /path/to/bastion-key.pem
+chmod 400 /path/to/vpc-b-key.pem
+```
+
+### 2. Create or Update `~/.ssh/config`
+Add the following block to your local `~/.ssh/config` file (replace placeholders and adjust `User` to `ubuntu` if using Ubuntu AMIs):
+
+```text
+Host bastion
+    HostName <bastion-public-ip>
+    User ec2-user
+    IdentityFile /path/to/bastion-key.pem
+
+Host vpc-b-instance-1
+    HostName <private-instance-1-ip>
+    User ec2-user
+    IdentityFile /path/to/vpc-b-key.pem
+    ProxyJump bastion
+
+Host vpc-b-instance-2
+    HostName <private-instance-2-ip>
+    User ec2-user
+    IdentityFile /path/to/vpc-b-key.pem
+    ProxyJump bastion
+```
+
+### 3. Connect to Private Instances
+Connect directly from your local machine using the configured host aliases:
+```bash
+ssh vpc-b-instance-1
+```
+or
+```bash
+ssh vpc-b-instance-2
+```
+
+---
+
+## Troubleshooting Quick Reference
+
+* **`Connection closed by UNKNOWN port 65535`:** Usually caused by SSH failing authentication on the first hop (the bastion host) because the bastion's `.pem` key was not supplied to `ProxyJump`. Using `~/.ssh/config` with distinct `IdentityFile` entries resolves this.
+* **`Connection timed out`:** Indicates a missing route in either VPC A or one of the AZ subnet route tables in VPC B, or a Security Group / Network ACL blocking TCP port `22`.
+* **Diagnostic Command:** Run `ssh -v vpc-b-instance-1` to inspect verbose logs and confirm whether authentication fails on Hop 1 (Bastion) or Hop 2 (VPC B target).
